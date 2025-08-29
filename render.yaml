@@ -1,0 +1,15 @@
+services:
+  - type: worker
+    name: hl-ws-wallet-watch
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python hl_ws_wallet_watch.py
+    envVars:
+      - key: HL_WS_URL
+        sync: false
+      - key: WALLET_ADDRESSES
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
