@@ -1,6 +1,6 @@
 import os, json, asyncio, collections
 import websockets, requests
-from typing import Any, Dict, List, Set, Tuple
+from typing import Any, Dict, Set
 
 WS_URL = os.environ.get("HL_WS_URL", "").strip()          # e.g. wss://api.hyperliquid.xyz/ws
 WALLETS = [w.strip().lower() for w in os.environ.get("WALLET_ADDRESSES", "").split(",") if w.strip()]
@@ -12,7 +12,7 @@ RECONNECT_BASE = float(os.environ.get("RECONNECT_BASE", "1.0"))
 RECONNECT_MAX  = float(os.environ.get("RECONNECT_MAX", "20.0"))
 
 # Behavior toggles
-SEND_BASELINE_ON_SNAPSHOT = True  # set False if you want to suppress baseline entirely
+SEND_BASELINE_ON_SNAPSHOT = True  # set False to suppress baseline entirely
 
 if not WS_URL:
     raise RuntimeError("Set HL_WS_URL (e.g., wss://api.hyperliquid.xyz/ws).")
@@ -50,7 +50,7 @@ def fmt_fill(f: Dict[str, Any]) -> str:
 
 def fill_key(user: str, f: Dict[str, Any]) -> str:
     """
-    Build a stable unique key for a fill. Prefer tid; then hash; then a tuple of fields.
+    Stable unique key for a fill. Prefer tid; then hash; else composite.
     """
     tid = f.get("tid")
     hsh = f.get("hash")
@@ -58,43 +58,42 @@ def fill_key(user: str, f: Dict[str, Any]) -> str:
         return f"{user}:tid:{tid}"
     if hsh is not None:
         return f"{user}:hash:{hsh}"
-    # fallback composite: time+coin+side+px+sz+oid
     coin = f.get("coin"); side = f.get("side"); px = f.get("px"); sz = f.get("sz"); oid = f.get("oid")
     t = f.get("time")
     return f"{user}:t:{t}|{coin}|{side}|{px}|{sz}|{oid}"
 
 class SeenCache:
     """
-    Per-wallet bounded cache to avoid duplicate alerts.
-    Uses OrderedDict as an LRU set with max size.
+    Per-wallet bounded cache to avoid duplicate alerts (LRU semantics).
     """
-    def __init__(self, max_size: int = 2000):
+    def __init__(self, max_size: int = 4000):
         self.max_size = max_size
         self._maps: Dict[str, collections.OrderedDict] = {}  # user -> LRU keys
 
     def add_and_check(self, user: str, key: str) -> bool:
         """
-        Returns True if key was already seen (i.e., duplicate).
+        Returns True if key was already seen (duplicate).
         """
         lru = self._maps.setdefault(user, collections.OrderedDict())
         if key in lru:
-            # move to end (recent)
             lru.move_to_end(key)
             return True
-        # new key
         lru[key] = None
         if len(lru) > self.max_size:
             lru.popitem(last=False)
         return False
 
 seen_cache = SeenCache(max_size=4000)
-baseline_sent: Set[str] = set()  # track wallets we already baseline-notified for this process
+baseline_sent: Set[str] = set()  # wallets already baseline-notified for this process
+CONNECT_MSG_SENT = False          # send the "connected" info only once per process
 
 async def subscribe_user(ws, addr: str):
+    # Subscribe to userFills per docs
     msg = {"method": "subscribe", "subscription": {"type": "userFills", "user": addr}}
     await ws.send(json.dumps(msg))
 
 async def ws_loop():
+    global CONNECT_MSG_SENT
     backoff = RECONNECT_BASE
     while True:
         try:
@@ -102,7 +101,9 @@ async def ws_loop():
                 print("Connected to", WS_URL)
                 for addr in WALLETS:
                     await subscribe_user(ws, addr)
-                tg_send(f"HL WS connected. Subscribed to userFills for {len(WALLETS)} wallet(s).")
+                if not CONNECT_MSG_SENT:
+                    tg_send(f"HL WS connected. Subscribed to userFills for {len(WALLETS)} wallet(s).")
+                    CONNECT_MSG_SENT = True
 
                 async for raw in ws:
                     try:
@@ -114,7 +115,7 @@ async def ws_loop():
                     data = msg.get("data")
 
                     if channel == "subscriptionResponse":
-                        # ack, ignore
+                        # ack
                         continue
 
                     if channel == "userFills" and isinstance(data, dict):
@@ -122,23 +123,22 @@ async def ws_loop():
                         fills = data.get("fills", [])
                         is_snapshot = bool(data.get("isSnapshot", False))
 
-                        # Skip unrelated user (shouldn't happen)
+                        # Ignore unrelated (shouldn't happen)
                         if user not in WALLETS:
                             continue
 
                         if is_snapshot:
-                            # Only send baseline once per process per wallet
+                            # Send baseline only once per wallet per process
                             if SEND_BASELINE_ON_SNAPSHOT and user not in baseline_sent:
                                 if fills:
                                     last = fills[-1]
                                     key = fill_key(user, last)
-                                    # Mark baseline as seen so we won't alert it again later
-                                    seen_cache.add_and_check(user, key)
+                                    seen_cache.add_and_check(user, key)  # mark as seen
                                     tg_send(f"HL {user} baseline -> {fmt_fill(last)}")
                                 baseline_sent.add(user)
                             else:
-                                # still mark the snapshot fills as seen to avoid repeats
-                                for f in fills[-5:]:  # mark last few as seen
+                                # mark a few latest snapshot fills as seen to prevent repeats
+                                for f in fills[-5:]:
                                     seen_cache.add_and_check(user, fill_key(user, f))
                             continue
 
@@ -146,7 +146,7 @@ async def ws_loop():
                         for f in fills:
                             key = fill_key(user, f)
                             if seen_cache.add_and_check(user, key):
-                                continue  # duplicate, skip
+                                continue
                             tg_send(f"HL {user} -> {fmt_fill(f)}")
 
         except asyncio.CancelledError:
